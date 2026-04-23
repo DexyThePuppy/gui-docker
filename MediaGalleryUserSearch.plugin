@@ -91,14 +91,6 @@ class _SharedMediaHook(MethodHook):
         self.plugin._on_shared_media_event(self.method_name, param)
 
 
-class _ActionBarMenuClickHook(MethodHook):
-    def __init__(self, plugin):
-        self.plugin = plugin
-
-    def before_hooked_method(self, param):
-        self.plugin._on_actionbar_menu_click(param)
-
-
 class MediaUserSearchbarPlugin(BasePlugin):
     def __init__(self):
         super().__init__()
@@ -107,6 +99,7 @@ class MediaUserSearchbarPlugin(BasePlugin):
         self._action_bar_ref = None
         self._layout_refs = {}   # layout_id -> weakref(layout)
         self._bar_state = {}     # layout_id -> {bar, edit, watcher}
+        self._last_applied_query = {}  # layout_id -> native query applied to search item
         self._query = ""
         self._debug = False
         self._suppress_text_events = False
@@ -138,6 +131,7 @@ class MediaUserSearchbarPlugin(BasePlugin):
 
         self._bar_state.clear()
         self._layout_refs.clear()
+        self._last_applied_query.clear()
         self._profile_ref = None
         self._action_bar_ref = None
         self._dlog("unloaded")
@@ -179,9 +173,7 @@ class MediaUserSearchbarPlugin(BasePlugin):
 
     def _install_hooks(self):
         self._hook_profile_activity()
-        self._hook_action_bar()
         self._hook_launch_activity()
-        self._hook_actionbar_menu_click()
         self._hook_shared_media_layout()
 
     def _register_profile_menu_item(self):
@@ -206,6 +198,7 @@ class MediaUserSearchbarPlugin(BasePlugin):
         for name in (
             "onFragmentCreate",
             "createMenu",
+            "createActionBarMenu",
             "setUserInfo",
             "updateOnlineStatus",
             "onAvatarClick",
@@ -239,12 +232,6 @@ class MediaUserSearchbarPlugin(BasePlugin):
         # User requested hook list
         for name in ("handleIntent", "onResume", "switchToAccount", "showPasscode"):
             self._hook_all_methods(cls, name, _LaunchHook(self, name))
-
-    def _hook_actionbar_menu_click(self):
-        cls = find_class("org.telegram.ui.ActionBar.ActionBar$ActionBarMenuOnItemClick")
-        if not cls:
-            return
-        self._hook_all_methods(cls, "onItemClick", _ActionBarMenuClickHook(self))
 
     def _hook_shared_media_layout(self):
         cls = find_class("org.telegram.ui.Components.SharedMediaLayout")
@@ -281,6 +268,11 @@ class MediaUserSearchbarPlugin(BasePlugin):
         profile = param.thisObject
         if profile is not None:
             self._profile_ref = weakref.ref(profile)
+            action_bar = _safe_call(profile.getActionBar)
+            if action_bar is not None:
+                self._action_bar_ref = weakref.ref(action_bar)
+                if method_name in ("createMenu", "createActionBarMenu"):
+                    run_on_ui_thread(lambda: self._ensure_actionbar_filter_item(action_bar))
         if method_name in ("onFragmentCreate", "setUserInfo", "createMenu"):
             run_on_ui_thread(self._sync_all_layouts, 60)
         elif method_name in ("updateOnlineStatus", "expandHeader"):
@@ -307,21 +299,6 @@ class MediaUserSearchbarPlugin(BasePlugin):
             if method_name == "createMenu":
                 run_on_ui_thread(lambda: self._ensure_actionbar_filter_item(action_bar))
             run_on_ui_thread(self._refresh_search_hint_on_action_bar)
-
-    def _on_actionbar_menu_click(self, param):
-        try:
-            if not param.args:
-                return
-            item_id = int(param.args[0])
-            if item_id != MENU_FILTER_ID:
-                return
-            fragment = get_last_fragment()
-            if fragment is None or "ProfileActivity" not in str(fragment.getClass().getName()):
-                return
-            run_on_ui_thread(self._show_filter_dialog)
-            param.setResult(None)
-        except Exception:
-            pass
 
     def _on_launch_event(self, method_name, param, before):
         if method_name in ("handleIntent", "switchToAccount", "showPasscode") and before:
@@ -471,20 +448,26 @@ class MediaUserSearchbarPlugin(BasePlugin):
         for lid in dead:
             self._layout_refs.pop(lid, None)
             self._bar_state.pop(lid, None)
+            self._last_applied_query.pop(lid, None)
 
     def _apply_query_to_layout(self, layout):
+        lid = id(layout)
         item = self._get_layout_search_item(layout)
         if item is None:
+            self._last_applied_query.pop(lid, None)
             return
 
         _safe_call(lambda: item.setSearchFieldHint(self._hint_text()))
 
         query = self._native_query(self._query)
+        if self._last_applied_query.get(lid) == query:
+            return
         if query:
             _safe_call(lambda: item.openSearch(False))
             _safe_call(lambda: item.setSearchFieldText(query, False))
         else:
             _safe_call(lambda: item.setSearchFieldText("", False))
+        self._last_applied_query[lid] = query
 
     def _get_layout_search_item(self, layout):
         if layout is None:
@@ -541,12 +524,17 @@ class MediaUserSearchbarPlugin(BasePlugin):
         if menu is None:
             return
 
-        existing = _safe_call(lambda: menu.getItem(MENU_FILTER_ID))
-        if existing is not None:
+        item = _safe_call(lambda: menu.getItem(MENU_FILTER_ID))
+
+        if item is None:
+            icon = self._resolve_drawable_id(action_bar.getContext(), "msg_search", "menu_search")
+            item = _safe_call(lambda: menu.addItem(jint(MENU_FILTER_ID), jint(icon)))
+        if item is None:
             return
 
-        icon = self._resolve_drawable_id(action_bar.getContext(), "msg_search", "menu_search")
-        _safe_call(lambda: menu.addItem(jint(MENU_FILTER_ID), jint(icon)))
+        # Use direct click listener on our own native menu item to avoid
+        # globally hooking every ActionBarMenu click in the app.
+        _safe_call(lambda: item.setOnClickListener(OnClickListener(lambda v: self._show_filter_dialog())))
 
     def _refresh_search_hint_on_action_bar(self):
         action_bar = self._action_bar()
