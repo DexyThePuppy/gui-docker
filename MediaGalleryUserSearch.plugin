@@ -527,7 +527,7 @@ class MediaUserSearchbarPlugin(BasePlugin):
         item = _safe_call(lambda: menu.getItem(MENU_FILTER_ID))
 
         if item is None:
-            icon = self._resolve_drawable_id(action_bar.getContext(), "msg_search", "menu_search")
+            icon = self._resolve_drawable_id(action_bar.getContext(), "msg_search", "menu_search", "ic_ab_search")
             item = _safe_call(lambda: menu.addItem(jint(MENU_FILTER_ID), jint(icon)))
         if item is None:
             return
