@@ -1,12 +1,11 @@
 __id__ = "media_user_searchbar"
 __name__ = "Media User Searchbar"
 __author__ = "@cursor_agent"
-__version__ = "1.0.0"
-__description__ = "Adds a searchbar to Profile media gallery to filter media by sender (from:@username / id)."
+__version__ = "1.1.0"
+__description__ = "Adds a profile media searchbar to filter by sender via from:@username / id."
 __min_version__ = "11.12.0"
 __icon__ = "msg_search"
 
-import re
 import weakref
 
 from java import dynamic_proxy, jint
@@ -14,22 +13,22 @@ from java import dynamic_proxy, jint
 from base_plugin import BasePlugin, MenuItemData, MenuItemType, MethodHook
 from hook_utils import find_class, get_private_field
 from android_utils import run_on_ui_thread, OnClickListener, log
-from client_utils import get_last_fragment, get_messages_controller
+from client_utils import get_last_fragment
 from ui.alert import AlertDialogBuilder
 from ui.bulletin import BulletinHelper
 from ui.settings import Header, Input, Switch, Text
 
-from android.view import ViewGroup, Gravity
-from android.widget import EditText, ImageView, LinearLayout
-from android.text import InputType, TextWatcher
 from android.graphics.drawable import GradientDrawable
+from android.text import InputType, TextWatcher
+from android.view import Gravity, ViewGroup
+from android.widget import EditText, ImageView, LinearLayout
 from org.telegram.messenger import AndroidUtilities
 from org.telegram.ui.ActionBar import Theme
 
 
 TAG = "[MediaUserSearch]"
-SEARCH_BAR_TAG = "media_user_searchbar_view"
 MENU_FILTER_ID = 917431
+SEARCH_BAR_TAG = "media_user_searchbar_view"
 
 
 def _safe_call(fn, default=None):
@@ -80,10 +79,7 @@ class _SharedMediaCtorHook(MethodHook):
         self.plugin = plugin
 
     def after_hooked_method(self, param):
-        try:
-            self.plugin._attach_shared_media_layout(param.thisObject)
-        except Exception:
-            pass
+        self.plugin._attach_shared_media_layout(param.thisObject)
 
 
 class _SharedMediaHook(MethodHook):
@@ -95,18 +91,25 @@ class _SharedMediaHook(MethodHook):
         self.plugin._on_shared_media_event(self.method_name, param)
 
 
+class _ActionBarMenuClickHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        self.plugin._on_actionbar_menu_click(param)
+
+
 class MediaUserSearchbarPlugin(BasePlugin):
     def __init__(self):
         super().__init__()
         self._hook_refs = []
         self._profile_ref = None
         self._action_bar_ref = None
-        self._layout_refs = {}        # layout_id -> weakref(layout)
-        self._bar_state = {}          # layout_id -> {bar, edit, watcher}
-        self._snapshots = {}          # layout_id -> media_type -> [MessageObject]
+        self._layout_refs = {}   # layout_id -> weakref(layout)
+        self._bar_state = {}     # layout_id -> {bar, edit, watcher}
         self._query = ""
         self._debug = False
-        self._last_user = None
+        self._suppress_text_events = False
 
     def on_plugin_load(self):
         self._query = str(self.get_setting("media_user_query", "") or "").strip()
@@ -132,12 +135,11 @@ class MediaUserSearchbarPlugin(BasePlugin):
                         parent.removeView(bar)
                 except Exception:
                     pass
+
         self._bar_state.clear()
         self._layout_refs.clear()
-        self._snapshots.clear()
         self._profile_ref = None
         self._action_bar_ref = None
-        self._last_user = None
         self._dlog("unloaded")
 
     def create_settings(self):
@@ -146,42 +148,40 @@ class MediaUserSearchbarPlugin(BasePlugin):
             Input(
                 key="media_user_query",
                 text="Default query",
-                subtext="Applied on open. Supports @username, id, name.",
+                subtext="Supports @username, numeric id, or plain text.",
                 default=str(self.get_setting("media_user_query", "")),
-                on_change=lambda v: self._on_query_changed(str(v or "")),
+                on_change=lambda v: self._set_query(str(v or "")),
             ),
             Input(
                 key="search_hint",
-                text="Searchbar hint",
-                subtext="Hint for inline media search field.",
+                text="Search hint",
+                subtext="Hint for the inline media searchbar.",
                 default=str(self.get_setting("search_hint", "Filter media by @username / user id")),
             ),
             Switch(
                 key="keep_after_resume",
                 text="Keep filter on resume",
-                subtext="Re-apply current filter when app returns to foreground.",
+                subtext="Re-apply current query after app resume/account switch.",
                 default=True,
             ),
             Switch(
                 key="debug_logs",
                 text="Debug logs",
-                subtext="Write detailed logs to Logcat.",
+                subtext="Print extra plugin logs.",
                 default=False,
-                on_change=self._toggle_debug,
+                on_change=lambda v: setattr(self, "_debug", bool(v)),
             ),
             Text(
-                text="Tip: query is converted to from:<query> for native media search when available.",
-                subtext="Fallback local filtering is used when native search API is unavailable.",
+                text="Query is applied as native SharedMedia search: from:<query>",
+                subtext="Uses built-in SharedMediaLayout search flow from AyuGram4A.",
             ),
         ]
-
-    def _toggle_debug(self, value):
-        self._debug = bool(value)
 
     def _install_hooks(self):
         self._hook_profile_activity()
         self._hook_action_bar()
         self._hook_launch_activity()
+        self._hook_actionbar_menu_click()
         self._hook_shared_media_layout()
 
     def _register_profile_menu_item(self):
@@ -202,6 +202,7 @@ class MediaUserSearchbarPlugin(BasePlugin):
         cls = find_class("org.telegram.ui.ProfileActivity")
         if not cls:
             return
+        # User requested hook list
         for name in (
             "onFragmentCreate",
             "createMenu",
@@ -216,6 +217,7 @@ class MediaUserSearchbarPlugin(BasePlugin):
         cls = find_class("org.telegram.ui.ActionBar.ActionBar")
         if not cls:
             return
+        # User requested hook list
         for name in (
             "setTitle",
             "setSubtitle",
@@ -234,8 +236,15 @@ class MediaUserSearchbarPlugin(BasePlugin):
         cls = find_class("org.telegram.ui.LaunchActivity")
         if not cls:
             return
+        # User requested hook list
         for name in ("handleIntent", "onResume", "switchToAccount", "showPasscode"):
             self._hook_all_methods(cls, name, _LaunchHook(self, name))
+
+    def _hook_actionbar_menu_click(self):
+        cls = find_class("org.telegram.ui.ActionBar.ActionBar$ActionBarMenuOnItemClick")
+        if not cls:
+            return
+        self._hook_all_methods(cls, "onItemClick", _ActionBarMenuClickHook(self))
 
     def _hook_shared_media_layout(self):
         cls = find_class("org.telegram.ui.Components.SharedMediaLayout")
@@ -250,12 +259,13 @@ class MediaUserSearchbarPlugin(BasePlugin):
                     self._hook_refs.append(refs)
         except Exception:
             pass
+
         for name in ("setUserInfo", "setChatInfo", "updateTabs", "scrollToPage"):
             self._hook_all_methods(cls, name, _SharedMediaHook(self, name))
 
-    def _hook_all_methods(self, cls, name, hook):
+    def _hook_all_methods(self, cls, method_name, hook):
         try:
-            refs = self.hook_all_methods(cls, name, hook)
+            refs = self.hook_all_methods(cls, method_name, hook)
             if not refs:
                 return
             if isinstance(refs, list):
@@ -268,98 +278,63 @@ class MediaUserSearchbarPlugin(BasePlugin):
     def _on_profile_event(self, method_name, param, before):
         if before:
             return
-        try:
-            profile = param.thisObject
+        profile = param.thisObject
+        if profile is not None:
             self._profile_ref = weakref.ref(profile)
-            if method_name == "setUserInfo" and param.args:
-                self._last_user = param.args[0]
-            if method_name in ("onFragmentCreate", "setUserInfo", "createMenu"):
-                run_on_ui_thread(self._sync_all_layouts, 50)
-            elif method_name in ("updateOnlineStatus", "expandHeader"):
-                run_on_ui_thread(self._refresh_search_hint_on_action_bar)
-            elif method_name == "onAvatarClick":
-                run_on_ui_thread(self._focus_current_search)
-        except Exception:
-            pass
+        if method_name in ("onFragmentCreate", "setUserInfo", "createMenu"):
+            run_on_ui_thread(self._sync_all_layouts, 60)
+        elif method_name in ("updateOnlineStatus", "expandHeader"):
+            run_on_ui_thread(self._refresh_search_hint_on_action_bar)
+        elif method_name == "onAvatarClick":
+            run_on_ui_thread(self._focus_current_search)
 
     def _on_action_bar_event(self, method_name, param, before):
         action_bar = param.thisObject
         if not self._belongs_to_profile(action_bar):
             return
+
         if method_name == "setSearchFieldHint" and before:
             if param.args and len(param.args) > 0:
                 param.args[0] = self._hint_text()
             return
+
         if before:
             return
+
         self._action_bar_ref = weakref.ref(action_bar)
+
         if method_name in ("createMenu", "setTitle", "setSubtitle", "setBackgroundColor"):
             if method_name == "createMenu":
                 run_on_ui_thread(lambda: self._ensure_actionbar_filter_item(action_bar))
             run_on_ui_thread(self._refresh_search_hint_on_action_bar)
-        elif method_name == "onButtonClick":
-            try:
-                if param.args and int(param.args[0]) == MENU_FILTER_ID:
-                    run_on_ui_thread(self._show_filter_dialog)
-                    param.setResult(None)
-            except Exception:
-                pass
 
-    def _ensure_actionbar_filter_item(self, action_bar):
-        if action_bar is None:
-            return
-        menu = _safe_call(action_bar.createMenu)
-        if menu is None:
-            menu = _safe_call(lambda: get_private_field(action_bar, "menu"))
-        if menu is None:
-            return
-        # Avoid duplicate item creation.
-        existing = _safe_call(lambda: menu.findItem(MENU_FILTER_ID))
-        if existing is not None:
-            return
-        icon = self._resolve_drawable_id(action_bar.getContext(), "msg_search", "menu_search")
+    def _on_actionbar_menu_click(self, param):
         try:
-            if hasattr(menu, "addItem"):
-                menu.addItem(MENU_FILTER_ID, icon)
+            if not param.args:
                 return
-        except Exception:
-            pass
-        # Reflection fallback: addItem(int, int) or addItemWithWidth(int, int, int)
-        try:
-            for m in menu.getClass().getDeclaredMethods():
-                name = str(m.getName() or "")
-                if not name.startswith("addItem"):
-                    continue
-                pts = m.getParameterTypes()
-                m.setAccessible(True)
-                if len(pts) == 2:
-                    m.invoke(menu, jint(MENU_FILTER_ID), jint(icon))
-                    return
-                if len(pts) == 3:
-                    m.invoke(menu, jint(MENU_FILTER_ID), jint(icon), jint(AndroidUtilities.dp(48)))
-                    return
+            item_id = int(param.args[0])
+            if item_id != MENU_FILTER_ID:
+                return
+            fragment = get_last_fragment()
+            if fragment is None or "ProfileActivity" not in str(fragment.getClass().getName()):
+                return
+            run_on_ui_thread(self._show_filter_dialog)
+            param.setResult(None)
         except Exception:
             pass
 
     def _on_launch_event(self, method_name, param, before):
-        if method_name == "handleIntent" and before:
-            self._snapshots.clear()
-            return
-        if method_name in ("switchToAccount", "showPasscode") and before:
-            self._snapshots.clear()
+        if method_name in ("handleIntent", "switchToAccount", "showPasscode") and before:
             return
         if method_name == "onResume" and not before:
             if bool(self.get_setting("keep_after_resume", True)):
-                run_on_ui_thread(self._sync_all_layouts, 100)
+                run_on_ui_thread(self._sync_all_layouts, 120)
 
     def _on_shared_media_event(self, method_name, param):
-        try:
-            layout = param.thisObject
-            self._attach_shared_media_layout(layout)
-            if method_name in ("setUserInfo", "setChatInfo", "updateTabs", "scrollToPage"):
-                run_on_ui_thread(lambda: self._apply_query_to_layout(layout), 20)
-        except Exception:
-            pass
+        layout = param.thisObject
+        self._attach_shared_media_layout(layout)
+        if method_name in ("setUserInfo", "setChatInfo", "updateTabs", "scrollToPage"):
+            run_on_ui_thread(lambda: self._apply_query_to_layout(layout), 30)
 
     def _attach_shared_media_layout(self, layout):
         if layout is None:
@@ -368,64 +343,57 @@ class MediaUserSearchbarPlugin(BasePlugin):
         if lid not in self._layout_refs:
             self._layout_refs[lid] = weakref.ref(layout)
         run_on_ui_thread(lambda: self._ensure_inline_search_bar(layout))
-        run_on_ui_thread(lambda: self._apply_query_to_layout(layout), 35)
+        run_on_ui_thread(lambda: self._apply_query_to_layout(layout), 80)
 
     def _ensure_inline_search_bar(self, layout):
         try:
             if not isinstance(layout, ViewGroup):
                 return
         except Exception:
-            pass
-        lid = id(layout)
-        current = self._bar_state.get(lid)
-        if current and current.get("bar") is not None:
-            try:
-                if current["bar"].getParent() is not None:
-                    self._apply_hint_to_edit(current.get("edit"))
-                    return
-            except Exception:
-                pass
+            return
 
-        ctx = _safe_call(lambda: layout.getContext())
+        lid = id(layout)
+        existing_state = self._bar_state.get(lid)
+        if existing_state and existing_state.get("bar") is not None:
+            bar = existing_state.get("bar")
+            if _safe_call(lambda: bar.getParent()) is not None:
+                self._apply_hint_to_edit(existing_state.get("edit"))
+                return
+
+        ctx = _safe_call(layout.getContext)
         if ctx is None:
             return
 
         container = LinearLayout(ctx)
-        container.setOrientation(LinearLayout.HORIZONTAL)
         container.setTag(SEARCH_BAR_TAG)
+        container.setOrientation(LinearLayout.HORIZONTAL)
         container.setGravity(Gravity.CENTER_VERTICAL)
         container.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(8), AndroidUtilities.dp(12), AndroidUtilities.dp(6))
 
         bg = GradientDrawable()
         bg.setCornerRadius(float(AndroidUtilities.dp(16)))
-        bg.setColor(self._theme_color("key_profile_tabBackground", 0x223D5A80))
+        bg.setColor(self._theme_color("key_profile_tabBackground", 0x223A4B60))
         container.setBackground(bg)
 
         edit = EditText(ctx)
         edit.setSingleLine(True)
         edit.setInputType(InputType.TYPE_CLASS_TEXT)
+        edit.setBackground(None)
         edit.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(6), AndroidUtilities.dp(12), AndroidUtilities.dp(6))
         edit.setTextColor(self._theme_color("key_windowBackgroundWhiteBlackText", 0xFFFFFFFF))
         edit.setHintTextColor(self._theme_color("key_windowBackgroundWhiteGrayText2", 0xFF90A4AE))
-        edit.setBackground(None)
         self._apply_hint_to_edit(edit)
-        try:
-            edit.setText(self._query)
-            edit.setSelection(len(self._query))
-        except Exception:
-            pass
+        _safe_call(lambda: edit.setText(self._query))
+        _safe_call(lambda: edit.setSelection(len(self._query)))
 
         clear_btn = ImageView(ctx)
-        clear_btn.setColorFilter(self._theme_color("key_profile_actionIcon", 0xFFFFFFFF))
         clear_btn.setImageResource(self._resolve_drawable_id(ctx, "msg_close", "ic_ab_back"))
+        clear_btn.setColorFilter(self._theme_color("key_profile_actionIcon", 0xFFFFFFFF))
         clear_btn.setOnClickListener(OnClickListener(lambda v: edit.setText("")))
 
         watcher = self._new_text_watcher(layout)
         if watcher is not None:
-            try:
-                edit.addTextChangedListener(watcher)
-            except Exception:
-                pass
+            _safe_call(lambda: edit.addTextChangedListener(watcher))
 
         lp_edit = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT)
         lp_edit.weight = 1.0
@@ -445,35 +413,50 @@ class MediaUserSearchbarPlugin(BasePlugin):
         self._bar_state[lid] = {"bar": container, "edit": edit, "watcher": watcher}
 
     def _new_text_watcher(self, layout):
+        plugin = self
+
+        class _Watcher(dynamic_proxy(TextWatcher)):
+            def beforeTextChanged(self, s, st, c, a):
+                pass
+
+            def onTextChanged(self, s, st, b, c):
+                pass
+
+            def afterTextChanged(self, s):
+                if plugin._suppress_text_events:
+                    return
+                value = str(s.toString() if s is not None else "").strip()
+                plugin._set_query(value, from_ui=True)
+                plugin._apply_query_to_layout(layout)
+
         try:
-            plugin = self
-
-            class _Watcher(dynamic_proxy(TextWatcher)):
-                def beforeTextChanged(self, s, st, c, a):
-                    pass
-
-                def onTextChanged(self, s, st, b, c):
-                    pass
-
-                def afterTextChanged(self, s):
-                    try:
-                        plugin._on_query_changed(str(s.toString() if s is not None else ""))
-                        plugin._apply_query_to_layout(layout)
-                    except Exception:
-                        pass
-
             return _Watcher()
         except Exception:
             return None
 
-    def _on_query_changed(self, value):
+    def _set_query(self, value, from_ui=False):
         normalized = str(value or "").strip()
+        if normalized == self._query and from_ui:
+            return
         self._query = normalized
-        try:
-            self.set_setting("media_user_query", normalized)
-        except Exception:
-            pass
+        _safe_call(lambda: self.set_setting("media_user_query", normalized))
+
+        if not from_ui:
+            self._update_bar_edit_texts(normalized)
+
         run_on_ui_thread(self._sync_all_layouts)
+
+    def _update_bar_edit_texts(self, value):
+        self._suppress_text_events = True
+        try:
+            for state in list(self._bar_state.values()):
+                edit = state.get("edit")
+                if edit is None:
+                    continue
+                _safe_call(lambda: edit.setText(value))
+                _safe_call(lambda: edit.setSelection(len(value)))
+        finally:
+            self._suppress_text_events = False
 
     def _sync_all_layouts(self):
         dead = []
@@ -484,223 +467,35 @@ class MediaUserSearchbarPlugin(BasePlugin):
                 continue
             self._ensure_inline_search_bar(layout)
             self._apply_query_to_layout(layout)
+
         for lid in dead:
             self._layout_refs.pop(lid, None)
             self._bar_state.pop(lid, None)
-            self._snapshots.pop(lid, None)
 
     def _apply_query_to_layout(self, layout):
+        item = self._get_layout_search_item(layout)
+        if item is None:
+            return
+
+        _safe_call(lambda: item.setSearchFieldHint(self._hint_text()))
+
+        query = self._native_query(self._query)
+        if query:
+            _safe_call(lambda: item.openSearch(False))
+            _safe_call(lambda: item.setSearchFieldText(query, False))
+        else:
+            _safe_call(lambda: item.setSearchFieldText("", False))
+
+    def _get_layout_search_item(self, layout):
         if layout is None:
-            return
-        query = self._query.strip()
-        native_query = self._native_query(query)
-        native_applied = self._try_apply_native_search(layout, native_query)
-        if native_applied:
-            self._restore_snapshot(layout)
-            return
-        self._apply_local_filter(layout, query)
-
-    def _try_apply_native_search(self, layout, query):
-        if query is None:
-            return False
-        # 1) try known searchItem fields (layout -> profile)
-        candidates = [layout, self._profile()]
-        for owner in candidates:
-            if owner is None:
-                continue
-            item = _safe_call(lambda: get_private_field(owner, "searchItem"))
-            if item is None:
-                item = _safe_call(lambda: get_private_field(owner, "searchMenuItem"))
-            if item is None:
-                continue
-            try:
-                _safe_call(lambda: item.openSearch(True))
-                _safe_call(lambda: item.setSearchFieldHint(self._hint_text()))
-                if hasattr(item, "setSearchFieldText"):
-                    item.setSearchFieldText(query, False)
-                    return True
-                if hasattr(item, "setSearchFieldCaption"):
-                    item.setSearchFieldCaption(query)
-                    return True
-            except Exception:
-                pass
-
-        # 2) reflection fallback for SharedMediaLayout methods containing "search"
-        try:
-            java_cls = layout.getClass()
-            for method in java_cls.getDeclaredMethods():
-                try:
-                    mname = str(method.getName() or "").lower()
-                    params = method.getParameterTypes()
-                    if "search" not in mname:
-                        continue
-                    method.setAccessible(True)
-                    if len(params) == 1:
-                        p0 = str(params[0].getName())
-                        if "java.lang.CharSequence" in p0 or "java.lang.String" in p0:
-                            method.invoke(layout, query)
-                            return True
-                    elif len(params) == 2:
-                        p0 = str(params[0].getName())
-                        p1 = str(params[1].getName())
-                        if ("java.lang.CharSequence" in p0 or "java.lang.String" in p0) and ("boolean" in p1 or "java.lang.Boolean" in p1):
-                            method.invoke(layout, query, False)
-                            return True
-                except Exception:
-                    continue
-        except Exception:
-            pass
-        return False
-
-    def _apply_local_filter(self, layout, query):
-        lid = id(layout)
-        if not query:
-            self._restore_snapshot(layout)
-            return
-
-        shared_media_data = _safe_call(lambda: get_private_field(layout, "sharedMediaData"))
-        if shared_media_data is None:
-            return
-
-        snapshots = self._snapshots.setdefault(lid, {})
-        target_id, needle = self._parse_query(query)
-
-        count = self._array_length(shared_media_data)
-        if count <= 0:
-            return
-
-        for i in range(count):
-            data = self._array_get(shared_media_data, i)
-            if data is None:
-                continue
-            messages = _safe_call(lambda: get_private_field(data, "messages"))
-            if messages is None:
-                continue
-            if i not in snapshots:
-                snapshots[i] = self._copy_java_list(messages)
-            source = snapshots.get(i, [])
-            matched = []
-            for msg in source:
-                if self._message_matches(msg, target_id, needle):
-                    matched.append(msg)
-            self._replace_java_list(messages, matched)
-            _safe_call(lambda: setattr(data, "totalCount", jint(len(matched))))
-
-        self._notify_pages_changed(layout)
-
-    def _restore_snapshot(self, layout):
-        lid = id(layout)
-        snapshots = self._snapshots.get(lid)
-        if not snapshots:
-            return
-        shared_media_data = _safe_call(lambda: get_private_field(layout, "sharedMediaData"))
-        if shared_media_data is None:
-            return
-        for i, source in list(snapshots.items()):
-            data = self._array_get(shared_media_data, i)
-            if data is None:
-                continue
-            messages = _safe_call(lambda: get_private_field(data, "messages"))
-            if messages is None:
-                continue
-            self._replace_java_list(messages, source)
-            _safe_call(lambda: setattr(data, "totalCount", jint(len(source))))
-        self._notify_pages_changed(layout)
-
-    def _notify_pages_changed(self, layout):
-        pages = _safe_call(lambda: get_private_field(layout, "mediaPages"))
-        if pages is None:
-            return
-        for page in self._iter_array_like(pages):
-            if page is None:
-                continue
-            lv = _safe_call(lambda: get_private_field(page, "listView"))
-            if lv is None:
-                continue
-            adapter = _safe_call(lambda: lv.getAdapter())
-            if adapter is not None:
-                _safe_call(adapter.notifyDataSetChanged)
-
-    def _message_matches(self, message_obj, target_id, needle):
-        sender_id = self._extract_sender_id(message_obj)
-        if target_id is not None:
-            return sender_id == target_id
-        if needle and sender_id is not None and needle in str(sender_id):
-            return True
-
-        user = self._resolve_user(sender_id)
-        if user is not None:
-            username = str(getattr(user, "username", "") or "").lower()
-            first_name = str(getattr(user, "first_name", "") or "").lower()
-            last_name = str(getattr(user, "last_name", "") or "").lower()
-            full = (first_name + " " + last_name).strip()
-            if needle in username or needle in first_name or needle in last_name or (full and needle in full):
-                return True
-
-        text_repr = str(message_obj).lower()
-        return bool(needle) and needle in text_repr
-
-    def _extract_sender_id(self, message_obj):
-        if message_obj is None:
             return None
-        for getter in ("getFromChatId", "getFromId", "getSenderId"):
-            try:
-                if hasattr(message_obj, getter):
-                    val = int(getattr(message_obj, getter)())
-                    if val != 0:
-                        return val
-            except Exception:
-                pass
-        owner = _safe_call(lambda: message_obj.messageOwner)
-        if owner is None:
-            owner = _safe_call(message_obj.getMessageOwner)
-        if owner is None:
-            return None
-        # TLRPC.Message.from_id: Peer (user_id/chat_id/channel_id)
-        from_id = _safe_call(lambda: owner.from_id)
-        if from_id is not None:
-            user_id = _safe_call(lambda: int(from_id.user_id))
-            if user_id:
-                return user_id
-            chat_id = _safe_call(lambda: int(from_id.chat_id))
-            if chat_id:
-                return -chat_id
-            channel_id = _safe_call(lambda: int(from_id.channel_id))
-            if channel_id:
-                return -channel_id
-        peer_id = _safe_call(lambda: owner.peer_id)
-        if peer_id is not None:
-            user_id = _safe_call(lambda: int(peer_id.user_id))
-            if user_id:
-                return user_id
-        return None
+        item = _safe_call(lambda: layout.getSearchItem())
+        if item is not None:
+            return item
+        return _safe_call(lambda: get_private_field(layout, "searchItem"))
 
-    def _resolve_user(self, user_id):
-        if user_id is None or user_id <= 0:
-            return None
-        mc = _safe_call(get_messages_controller)
-        if mc is not None:
-            try:
-                return mc.getUser(user_id)
-            except Exception:
-                pass
-        return None
-
-    def _parse_query(self, query):
-        q = str(query or "").strip()
-        if q.startswith("from:"):
-            q = q[5:].strip()
-        if q.startswith("@"):
-            q = q[1:].strip()
-        if re.fullmatch(r"-?\d+", q):
-            try:
-                return int(q), ""
-            except Exception:
-                pass
-        return None, q.lower()
-
-    def _native_query(self, query):
-        q = str(query or "").strip()
+    def _native_query(self, value):
+        q = str(value or "").strip()
         if not q:
             return ""
         if q.lower().startswith("from:"):
@@ -713,47 +508,59 @@ class MediaUserSearchbarPlugin(BasePlugin):
         fragment = get_last_fragment()
         if fragment is None:
             return
-        act = _safe_call(fragment.getParentActivity)
-        if act is None:
+        activity = _safe_call(fragment.getParentActivity)
+        if activity is None:
             return
-        et = EditText(act)
-        et.setInputType(InputType.TYPE_CLASS_TEXT)
-        et.setSingleLine(True)
-        et.setHint(self._hint_text())
-        try:
-            et.setText(self._query)
-            et.setSelection(len(self._query))
-        except Exception:
-            pass
-        b = AlertDialogBuilder(act)
-        b.setTitle("Media filter by user")
-        b.setView(et)
-        b.setPositiveButton("Apply", lambda d, w: self._on_dialog_apply(et))
-        b.setNegativeButton("Clear", lambda d, w: self._on_query_changed(""))
-        b.setNeutralButton("Cancel", None)
-        b.show()
 
-    def _on_dialog_apply(self, edit_text):
-        val = _safe_call(lambda: str(edit_text.getText()).strip(), "")
-        self._on_query_changed(val)
-        self._show_bulletin("Media filter: %s" % (val or "off"))
+        edit = EditText(activity)
+        edit.setInputType(InputType.TYPE_CLASS_TEXT)
+        edit.setSingleLine(True)
+        edit.setHint(self._hint_text())
+        _safe_call(lambda: edit.setText(self._query))
+        _safe_call(lambda: edit.setSelection(len(self._query)))
 
-    def _focus_current_search(self):
-        layout = self._current_layout()
-        if layout is None:
+        builder = AlertDialogBuilder(activity)
+        builder.setTitle("Media filter by user")
+        builder.setView(edit)
+        builder.setPositiveButton("Apply", lambda d, w: self._on_dialog_apply(edit))
+        builder.setNegativeButton("Clear", lambda d, w: self._set_query(""))
+        builder.setNeutralButton("Cancel", None)
+        builder.show()
+
+    def _on_dialog_apply(self, edit):
+        value = _safe_call(lambda: str(edit.getText()).strip(), "")
+        self._set_query(value)
+        self._show_bulletin("Media filter: %s" % (value or "off"))
+
+    def _ensure_actionbar_filter_item(self, action_bar):
+        if action_bar is None:
             return
-        state = self._bar_state.get(id(layout))
-        if not state:
+        menu = _safe_call(action_bar.createMenu)
+        if menu is None:
+            menu = _safe_call(lambda: get_private_field(action_bar, "menu"))
+        if menu is None:
             return
-        edit = state.get("edit")
-        if edit is not None:
-            _safe_call(edit.requestFocus)
+
+        existing = _safe_call(lambda: menu.getItem(MENU_FILTER_ID))
+        if existing is not None:
+            return
+
+        icon = self._resolve_drawable_id(action_bar.getContext(), "msg_search", "menu_search")
+        _safe_call(lambda: menu.addItem(jint(MENU_FILTER_ID), jint(icon)))
 
     def _refresh_search_hint_on_action_bar(self):
         action_bar = self._action_bar()
         if action_bar is None:
             return
         _safe_call(lambda: action_bar.setSearchFieldHint(self._hint_text()))
+
+    def _focus_current_search(self):
+        for state in list(self._bar_state.values()):
+            edit = state.get("edit")
+            if edit is None:
+                continue
+            _safe_call(edit.requestFocus)
+            return
 
     def _apply_hint_to_edit(self, edit):
         if edit is None:
@@ -769,13 +576,6 @@ class MediaUserSearchbarPlugin(BasePlugin):
     def _action_bar(self):
         return _safe_call(self._action_bar_ref) if self._action_bar_ref else None
 
-    def _current_layout(self):
-        for ref in list(self._layout_refs.values()):
-            layout = _safe_call(ref)
-            if layout is not None:
-                return layout
-        return None
-
     def _belongs_to_profile(self, action_bar):
         if action_bar is None:
             return False
@@ -784,10 +584,7 @@ class MediaUserSearchbarPlugin(BasePlugin):
             parent = _safe_call(lambda: get_private_field(action_bar, "fragment"))
         if parent is None:
             return False
-        try:
-            return "ProfileActivity" in str(parent.getClass().getName())
-        except Exception:
-            return "ProfileActivity" in str(parent)
+        return "ProfileActivity" in str(_safe_call(lambda: parent.getClass().getName(), str(parent)))
 
     def _theme_color(self, key_name, fallback):
         try:
@@ -804,77 +601,18 @@ class MediaUserSearchbarPlugin(BasePlugin):
         try:
             res = context.getResources()
             pkg = context.getPackageName()
-            for n in names:
-                rid = int(res.getIdentifier(n, "drawable", pkg))
+            for name in names:
+                rid = int(res.getIdentifier(name, "drawable", pkg))
                 if rid != 0:
                     return rid
         except Exception:
             pass
         return 0
 
-    def _array_length(self, arr):
-        if arr is None:
-            return 0
-        try:
-            return int(arr.length)
-        except Exception:
-            pass
-        try:
-            return int(arr.size())
-        except Exception:
-            pass
-        try:
-            return int(len(arr))
-        except Exception:
-            return 0
-
-    def _array_get(self, arr, idx):
-        try:
-            return arr[idx]
-        except Exception:
-            pass
-        try:
-            return arr.get(idx)
-        except Exception:
-            return None
-
-    def _iter_array_like(self, arr):
-        n = self._array_length(arr)
-        for i in range(n):
-            yield self._array_get(arr, i)
-
-    def _copy_java_list(self, jlist):
-        out = []
-        if jlist is None:
-            return out
-        try:
-            n = int(jlist.size())
-            for i in range(n):
-                out.append(jlist.get(i))
-        except Exception:
-            pass
-        return out
-
-    def _replace_java_list(self, jlist, values):
-        if jlist is None:
-            return
-        try:
-            jlist.clear()
-            for v in values:
-                jlist.add(v)
-        except Exception:
-            pass
-
     def _show_bulletin(self, text):
-        try:
-            BulletinHelper.show_info(str(text))
-        except Exception:
-            pass
+        _safe_call(lambda: BulletinHelper.show_info(str(text)))
 
     def _dlog(self, message):
         if not self._debug:
             return
-        try:
-            log("%s %s" % (TAG, str(message)))
-        except Exception:
-            pass
+        _safe_call(lambda: log("%s %s" % (TAG, str(message))))
