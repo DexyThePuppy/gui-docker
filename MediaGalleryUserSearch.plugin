@@ -503,11 +503,11 @@ class MediaUserSearchbarPlugin(BasePlugin):
         _safe_call(lambda: edit.setSelection(len(self._query)))
 
         builder = AlertDialogBuilder(activity)
-        builder.setTitle("Media filter by user")
-        builder.setView(edit)
-        builder.setPositiveButton("Apply", lambda d, w: self._on_dialog_apply(edit))
-        builder.setNegativeButton("Clear", lambda d, w: self._set_query(""))
-        builder.setNeutralButton("Cancel", None)
+        builder.set_title("Media filter by user")
+        builder.set_view(edit)
+        builder.set_positive_button("Apply", lambda d, w: self._on_dialog_apply(edit))
+        builder.set_negative_button("Clear", lambda d, w: self._set_query(""))
+        builder.set_neutral_button("Cancel", None)
         builder.show()
 
     def _on_dialog_apply(self, edit):
