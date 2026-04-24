@@ -345,6 +345,14 @@ class MediaUserSearchbarPlugin(BasePlugin):
         _safe_call(lambda: item.setSearchFieldHint(self._hint_text()))
         self._bind_native_search_field(layout)
 
+        # In ProfileActivity, SharedMedia search button becomes truly usable only
+        # after user scrolls to media header area. Until then, defer applying to
+        # avoid forcing search mode immediately after opening profile.
+        if not self._is_media_search_ready(layout, item):
+            if self._debug:
+                self._dlog("deferred apply: media section is not visible yet")
+            return
+
         native_query = self._native_query(self._query)
         previous = self._last_applied_query.get(lid)
         if previous == native_query:
@@ -662,6 +670,9 @@ class MediaUserSearchbarPlugin(BasePlugin):
         if item is None:
             self._show_bulletin("Native media search not available")
             return
+        if not self._is_media_search_ready(layout, item):
+            self._show_bulletin("Scroll down to the media section first")
+            return
         native_query = self._native_query(self._query)
         self._suppress_text_events = True
         try:
@@ -686,6 +697,21 @@ class MediaUserSearchbarPlugin(BasePlugin):
 
     def _focus_current_search(self):
         self._open_native_search_from_menu()
+
+    def _is_media_search_ready(self, layout, item):
+        if layout is None or item is None:
+            return False
+        # Search tab type support check.
+        can_search_for_tab = bool(_safe_call(layout.isSearchItemVisible, True))
+        if not can_search_for_tab:
+            return False
+        # Actual view visibility check (ProfileActivity toggles this when media
+        # header appears/disappears while scrolling).
+        visible = int(_safe_call(item.getVisibility, 8))
+        if visible != 0:
+            return False
+        alpha = float(_safe_call(item.getAlpha, 1.0) or 0.0)
+        return alpha > 0.0
 
     def _current_layout(self):
         for ref in list(self._layout_refs.values()):
