@@ -6,6 +6,7 @@ __description__ = "Adds a profile media searchbar to filter by sender via from:@
 __min_version__ = "11.12.0"
 __icon__ = "msg_search"
 
+import time
 import weakref
 
 from java import dynamic_proxy, jint
@@ -19,10 +20,11 @@ from ui.bulletin import BulletinHelper
 from ui.settings import Header, Input, Switch, Text
 
 from android.graphics.drawable import GradientDrawable
+from android.content import Context, ClipData
 from android.text import InputType, TextWatcher
 from android.view import Gravity, ViewGroup
 from android.widget import EditText, ImageView, LinearLayout
-from org.telegram.messenger import AndroidUtilities
+from org.telegram.messenger import AndroidUtilities, ApplicationLoader
 from org.telegram.ui.ActionBar import Theme
 
 
@@ -100,6 +102,7 @@ class MediaUserSearchbarPlugin(BasePlugin):
         self._layout_refs = {}   # layout_id -> weakref(layout)
         self._bar_state = {}     # layout_id -> {bar, edit, watcher}
         self._last_applied_query = {}  # layout_id -> native query applied to search item
+        self._log_buffer = []
         self._query = ""
         self._debug = False
         self._suppress_text_events = False
@@ -164,6 +167,11 @@ class MediaUserSearchbarPlugin(BasePlugin):
                 subtext="Print extra plugin logs.",
                 default=False,
                 on_change=lambda v: setattr(self, "_debug", bool(v)),
+            ),
+            Text(
+                text="Copy plugin logs",
+                subtext="Copies recent debug logs to clipboard.",
+                on_click=lambda v: self._copy_logs_to_clipboard(),
             ),
             Text(
                 text="Query is applied as native SharedMedia search: from:<query>",
@@ -468,6 +476,8 @@ class MediaUserSearchbarPlugin(BasePlugin):
         else:
             _safe_call(lambda: item.setSearchFieldText("", False))
         self._last_applied_query[lid] = query
+        if self._debug:
+            run_on_ui_thread(lambda: self._log_filtered_media_snapshot(layout, query, "apply"), 250)
 
     def _get_layout_search_item(self, layout):
         if layout is None:
@@ -600,7 +610,134 @@ class MediaUserSearchbarPlugin(BasePlugin):
     def _show_bulletin(self, text):
         _safe_call(lambda: BulletinHelper.show_info(str(text)))
 
+    def _copy_logs_to_clipboard(self):
+        try:
+            text = "\n".join(self._log_buffer[-300:]) if self._log_buffer else "MediaUserSearch: logs are empty."
+            context = _safe_call(lambda: ApplicationLoader.applicationContext)
+            if context is None:
+                self._show_bulletin("Clipboard unavailable: no app context")
+                return
+            clipboard = _safe_call(lambda: context.getSystemService(Context.CLIPBOARD_SERVICE))
+            if clipboard is None:
+                self._show_bulletin("Clipboard service not found")
+                return
+            clip = ClipData.newPlainText("MediaUserSearch logs", text)
+            clipboard.setPrimaryClip(clip)
+            self._show_bulletin("Plugin logs copied")
+        except Exception as e:
+            self._show_bulletin("Failed to copy plugin logs")
+            self._dlog("copy logs error: %s" % e)
+
+    def _log_filtered_media_snapshot(self, layout, query, stage):
+        try:
+            data_array = _safe_call(lambda: get_private_field(layout, "sharedMediaData"))
+            if data_array is None:
+                self._dlog("filtered list [%s] query='%s' -> sharedMediaData unavailable" % (stage, query))
+                return
+
+            parts = []
+            total = 0
+            tabs_count = self._array_length(data_array)
+            for tab_index in range(tabs_count):
+                data = self._array_get(data_array, tab_index)
+                if data is None:
+                    continue
+                messages = _safe_call(lambda: get_private_field(data, "messages"))
+                if messages is None:
+                    continue
+                count = _safe_call(lambda: int(messages.size()), 0)
+                total += max(0, count)
+                if count <= 0:
+                    continue
+                max_log_items = min(count, 15)
+                items = []
+                for i in range(max_log_items):
+                    msg = _safe_call(lambda i=i: messages.get(i))
+                    if msg is None:
+                        continue
+                    mid = self._extract_message_id(msg)
+                    sid = self._extract_sender_id(msg)
+                    items.append("%s:%s" % (mid, sid))
+                suffix = "..." if count > max_log_items else ""
+                parts.append("tab%d=%d[%s%s]" % (tab_index, count, ",".join(items), suffix))
+
+            details = " | ".join(parts) if parts else "no-items"
+            self._dlog("filtered list [%s] query='%s' tabs=%d total=%d %s" % (stage, query, tabs_count, total, details))
+        except Exception as e:
+            self._dlog("filtered list log error: %s" % e)
+
+    def _extract_message_id(self, message_obj):
+        if message_obj is None:
+            return 0
+        for getter in ("getId", "getRealId"):
+            try:
+                if hasattr(message_obj, getter):
+                    return int(getattr(message_obj, getter)())
+            except Exception:
+                pass
+        owner = _safe_call(lambda: message_obj.messageOwner)
+        if owner is not None:
+            return int(_safe_call(lambda: owner.id, 0) or 0)
+        return 0
+
+    def _extract_sender_id(self, message_obj):
+        if message_obj is None:
+            return 0
+        for getter in ("getFromChatId", "getFromId", "getSenderId"):
+            try:
+                if hasattr(message_obj, getter):
+                    value = int(getattr(message_obj, getter)())
+                    if value != 0:
+                        return value
+            except Exception:
+                pass
+
+        owner = _safe_call(lambda: message_obj.messageOwner)
+        if owner is None:
+            return 0
+        from_id = _safe_call(lambda: owner.from_id)
+        if from_id is not None:
+            uid = int(_safe_call(lambda: from_id.user_id, 0) or 0)
+            if uid:
+                return uid
+            cid = int(_safe_call(lambda: from_id.chat_id, 0) or 0)
+            if cid:
+                return -cid
+            chid = int(_safe_call(lambda: from_id.channel_id, 0) or 0)
+            if chid:
+                return -chid
+        return 0
+
+    def _array_length(self, arr):
+        if arr is None:
+            return 0
+        try:
+            return int(arr.length)
+        except Exception:
+            pass
+        try:
+            return int(arr.size())
+        except Exception:
+            pass
+        try:
+            return int(len(arr))
+        except Exception:
+            return 0
+
+    def _array_get(self, arr, idx):
+        try:
+            return arr[idx]
+        except Exception:
+            pass
+        try:
+            return arr.get(idx)
+        except Exception:
+            return None
+
     def _dlog(self, message):
-        if not self._debug:
-            return
-        _safe_call(lambda: log("%s %s" % (TAG, str(message))))
+        line = "[%s] %s" % (time.strftime("%H:%M:%S"), str(message))
+        self._log_buffer.append(line)
+        if len(self._log_buffer) > 500:
+            self._log_buffer = self._log_buffer[-350:]
+        if self._debug:
+            _safe_call(lambda: log("%s %s" % (TAG, line)))
