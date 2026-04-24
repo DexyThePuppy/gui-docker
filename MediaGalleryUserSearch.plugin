@@ -128,6 +128,12 @@ class MediaUserSearchbarPlugin(BasePlugin):
                 default=str(self.get_setting("search_hint", "Filter media by @username / user id")),
             ),
             Switch(
+                key="groups_only",
+                text="Groups/channels only",
+                subtext="Filter works only in group/channel profiles, not in 1:1 user profiles.",
+                default=True,
+            ),
+            Switch(
                 key="keep_after_resume",
                 text="Keep filter on resume",
                 subtext="Re-apply current query after app resume/account switch.",
@@ -283,6 +289,8 @@ class MediaUserSearchbarPlugin(BasePlugin):
     def _bind_native_search_field(self, layout):
         if layout is None:
             return
+        if not self._is_layout_allowed(layout):
+            return
         item = self._get_layout_search_item(layout)
         if item is None:
             return
@@ -337,6 +345,12 @@ class MediaUserSearchbarPlugin(BasePlugin):
 
     def _apply_query_to_layout(self, layout):
         lid = id(layout)
+        if not self._is_layout_allowed(layout):
+            self._last_applied_query.pop(lid, None)
+            data_array = _safe_call(lambda: get_private_field(layout, "sharedMediaData"))
+            if data_array is not None:
+                self._restore_original_media(layout, data_array)
+            return
         item = self._get_layout_search_item(layout)
         if item is None:
             self._last_applied_query.pop(lid, None)
@@ -384,6 +398,8 @@ class MediaUserSearchbarPlugin(BasePlugin):
             run_on_ui_thread(lambda: self._log_filtered_media_snapshot(layout, native_query, "apply-new"), 500)
 
     def _apply_local_sender_filter(self, layout):
+        if not self._is_layout_allowed(layout):
+            return
         data_array = _safe_call(lambda: get_private_field(layout, "sharedMediaData"))
         if data_array is None:
             return
@@ -473,6 +489,8 @@ class MediaUserSearchbarPlugin(BasePlugin):
             run_on_ui_thread(lambda: self._log_filtered_media_snapshot(layout, self._native_query(self._query), "media-loaded"), 200)
 
     def _schedule_history_prefetch(self, layout, reason):
+        if not self._is_layout_allowed(layout):
+            return
         target_id, target_text = self._parse_sender_filter(self._query)
         if target_id is None and not target_text:
             return
@@ -512,6 +530,8 @@ class MediaUserSearchbarPlugin(BasePlugin):
         return bool(_safe_call(lambda: data.loading, False))
 
     def _request_next_history_page(self, layout):
+        if not self._is_layout_allowed(layout):
+            return False
         data_array = _safe_call(lambda: get_private_field(layout, "sharedMediaData"))
         if data_array is None:
             return False
@@ -659,12 +679,19 @@ class MediaUserSearchbarPlugin(BasePlugin):
             item = _safe_call(lambda: menu.addItem(jint(MENU_FILTER_ID), jint(icon)))
         if item is None:
             return
-        _safe_call(lambda: item.setOnClickListener(OnClickListener(lambda v: self._open_native_search_from_menu())))
+        profile = _safe_call(self._profile)
+        allowed = self._is_profile_allowed(profile)
+        _safe_call(lambda: item.setVisibility(0 if allowed else 8))
+        if allowed:
+            _safe_call(lambda: item.setOnClickListener(OnClickListener(lambda v: self._open_native_search_from_menu())))
 
     def _open_native_search_from_menu(self):
         layout = self._current_layout()
         if layout is None:
             self._show_bulletin("Open profile media first")
+            return
+        if not self._is_layout_allowed(layout):
+            self._show_bulletin("Groups-only mode: open a group/channel profile")
             return
         item = self._get_layout_search_item(layout)
         if item is None:
@@ -712,6 +739,38 @@ class MediaUserSearchbarPlugin(BasePlugin):
             return False
         alpha = float(_safe_call(item.getAlpha, 1.0) or 0.0)
         return alpha > 0.0
+
+    def _groups_only_enabled(self):
+        return bool(self.get_setting("groups_only", True))
+
+    def _is_profile_group_context(self, profile):
+        if profile is None:
+            return True
+        chat_id = int(_safe_call(lambda: get_private_field(profile, "chatId"), 0) or 0)
+        if chat_id != 0:
+            return True
+        user_id = int(_safe_call(lambda: get_private_field(profile, "userId"), 0) or 0)
+        if user_id != 0:
+            return False
+        return True
+
+    def _is_profile_allowed(self, profile):
+        if not self._groups_only_enabled():
+            return True
+        return self._is_profile_group_context(profile)
+
+    def _is_layout_allowed(self, layout):
+        if not self._groups_only_enabled():
+            return True
+        profile = _safe_call(lambda: get_private_field(layout, "profileActivity"))
+        if profile is not None:
+            return self._is_profile_group_context(profile)
+        dialog_id = int(_safe_call(lambda: get_private_field(layout, "dialog_id"), 0) or 0)
+        if dialog_id < 0:
+            return True
+        if dialog_id > 0:
+            return False
+        return True
 
     def _current_layout(self):
         for ref in list(self._layout_refs.values()):
