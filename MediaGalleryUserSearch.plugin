@@ -14,7 +14,7 @@ from java import dynamic_proxy, jint
 from base_plugin import BasePlugin, MenuItemData, MenuItemType, MethodHook
 from hook_utils import find_class, get_private_field
 from android_utils import run_on_ui_thread, OnClickListener, log
-from client_utils import get_last_fragment
+from client_utils import get_last_fragment, get_messages_controller
 from ui.alert import AlertDialogBuilder
 from ui.bulletin import BulletinHelper
 from ui.settings import Header, Input, Switch, Text
@@ -102,6 +102,7 @@ class MediaUserSearchbarPlugin(BasePlugin):
         self._layout_refs = {}   # layout_id -> weakref(layout)
         self._bar_state = {}     # layout_id -> {bar, edit, watcher}
         self._last_applied_query = {}  # layout_id -> native query applied to search item
+        self._original_media = {}  # layout_id -> tab_index -> [MessageObject]
         self._log_buffer = []
         self._query = ""
         self._debug = False
@@ -135,6 +136,7 @@ class MediaUserSearchbarPlugin(BasePlugin):
         self._bar_state.clear()
         self._layout_refs.clear()
         self._last_applied_query.clear()
+        self._original_media.clear()
         self._profile_ref = None
         self._action_bar_ref = None
         self._dlog("unloaded")
@@ -457,6 +459,7 @@ class MediaUserSearchbarPlugin(BasePlugin):
             self._layout_refs.pop(lid, None)
             self._bar_state.pop(lid, None)
             self._last_applied_query.pop(lid, None)
+            self._original_media.pop(lid, None)
 
     def _apply_query_to_layout(self, layout):
         lid = id(layout)
@@ -469,6 +472,9 @@ class MediaUserSearchbarPlugin(BasePlugin):
 
         query = self._native_query(self._query)
         if self._last_applied_query.get(lid) == query:
+            self._apply_local_sender_filter(layout)
+            if self._debug:
+                run_on_ui_thread(lambda: self._log_filtered_media_snapshot(layout, query, "apply"), 250)
             return
         if query:
             _safe_call(lambda: item.openSearch(False))
@@ -476,6 +482,8 @@ class MediaUserSearchbarPlugin(BasePlugin):
         else:
             _safe_call(lambda: item.setSearchFieldText("", False))
         self._last_applied_query[lid] = query
+        # Native search runs first; local pass enforces strict sender match.
+        run_on_ui_thread(lambda: self._apply_local_sender_filter(layout), 120)
         if self._debug:
             run_on_ui_thread(lambda: self._log_filtered_media_snapshot(layout, query, "apply"), 250)
 
@@ -496,6 +504,157 @@ class MediaUserSearchbarPlugin(BasePlugin):
         if q.startswith("@"):
             return "from:" + q[1:]
         return "from:" + q
+
+    def _parse_sender_filter(self, value):
+        q = str(value or "").strip()
+        if not q:
+            return None, ""
+        if q.lower().startswith("from:"):
+            q = q[5:].strip()
+        if q.startswith("@"):
+            q = q[1:].strip()
+        if not q:
+            return None, ""
+        try:
+            if q.lstrip("-").isdigit():
+                return int(q), ""
+        except Exception:
+            pass
+        return None, q.lower()
+
+    def _apply_local_sender_filter(self, layout):
+        data_array = _safe_call(lambda: get_private_field(layout, "sharedMediaData"))
+        if data_array is None:
+            return
+        lid = id(layout)
+        target_id, target_text = self._parse_sender_filter(self._query)
+
+        # Query cleared -> restore original media snapshots.
+        if target_id is None and not target_text:
+            self._restore_original_media(layout, data_array)
+            return
+
+        snapshots = self._ensure_original_media_snapshot(layout, data_array)
+        for tab_index, source in list(snapshots.items()):
+            data = self._array_get(data_array, tab_index)
+            if data is None:
+                continue
+            messages = _safe_call(lambda: get_private_field(data, "messages"))
+            if messages is None:
+                continue
+            filtered = []
+            for msg in source:
+                if self._message_matches_sender_filter(msg, target_id, target_text):
+                    filtered.append(msg)
+            self._replace_java_list(messages, filtered)
+            self._sync_total_count_field(data, len(filtered))
+        self._notify_media_pages_changed(layout)
+
+    def _ensure_original_media_snapshot(self, layout, data_array):
+        lid = id(layout)
+        tab_map = self._original_media.setdefault(lid, {})
+        tabs_count = self._array_length(data_array)
+        for tab_index in range(tabs_count):
+            data = self._array_get(data_array, tab_index)
+            if data is None:
+                continue
+            messages = _safe_call(lambda: get_private_field(data, "messages"))
+            if messages is None:
+                continue
+            # Capture baseline per-tab only once while filter is active.
+            if tab_index not in tab_map:
+                tab_map[tab_index] = self._copy_java_list(messages)
+        return tab_map
+
+    def _restore_original_media(self, layout, data_array):
+        lid = id(layout)
+        tab_map = self._original_media.get(lid)
+        if not tab_map:
+            # No snapshots yet: refresh baseline for future filtering.
+            self._ensure_original_media_snapshot(layout, data_array)
+            return
+        for tab_index, original in list(tab_map.items()):
+            data = self._array_get(data_array, tab_index)
+            if data is None:
+                continue
+            messages = _safe_call(lambda: get_private_field(data, "messages"))
+            if messages is None:
+                continue
+            self._replace_java_list(messages, original)
+            self._sync_total_count_field(data, len(original))
+        self._notify_media_pages_changed(layout)
+        # Rebuild baseline from restored current state.
+        self._original_media.pop(lid, None)
+        self._ensure_original_media_snapshot(layout, data_array)
+
+    def _message_matches_sender_filter(self, message_obj, target_id, target_text):
+        sid = self._extract_sender_id(message_obj)
+        if target_id is not None:
+            return sid == target_id
+        if not target_text:
+            return True
+
+        if sid != 0 and target_text in str(sid):
+            return True
+        user = self._resolve_user(sid)
+        if user is not None:
+            username = str(_safe_call(lambda: user.username, "") or "").lower()
+            first_name = str(_safe_call(lambda: user.first_name, "") or "").lower()
+            last_name = str(_safe_call(lambda: user.last_name, "") or "").lower()
+            full_name = (first_name + " " + last_name).strip()
+            if target_text in username or target_text in first_name or target_text in last_name or (full_name and target_text in full_name):
+                return True
+
+        post_author = str(_safe_call(lambda: message_obj.messageOwner.post_author, "") or "").lower()
+        if target_text and post_author and target_text in post_author:
+            return True
+        return False
+
+    def _resolve_user(self, sender_id):
+        if sender_id <= 0:
+            return None
+        controller = _safe_call(get_messages_controller)
+        if controller is None:
+            return None
+        return _safe_call(lambda: controller.getUser(sender_id))
+
+    def _copy_java_list(self, jlist):
+        out = []
+        if jlist is None:
+            return out
+        size = _safe_call(lambda: int(jlist.size()), 0)
+        for i in range(size):
+            item = _safe_call(lambda i=i: jlist.get(i))
+            if item is not None:
+                out.append(item)
+        return out
+
+    def _replace_java_list(self, jlist, items):
+        if jlist is None:
+            return
+        _safe_call(jlist.clear)
+        for item in items:
+            _safe_call(lambda item=item: jlist.add(item))
+
+    def _sync_total_count_field(self, data_obj, count):
+        # Different builds keep total in different fields; try common names.
+        _safe_call(lambda: setattr(data_obj, "totalCount", jint(count)))
+        _safe_call(lambda: setattr(data_obj, "count", jint(count)))
+
+    def _notify_media_pages_changed(self, layout):
+        pages = _safe_call(lambda: get_private_field(layout, "mediaPages"))
+        if pages is None:
+            return
+        for i in range(self._array_length(pages)):
+            page = self._array_get(pages, i)
+            if page is None:
+                continue
+            list_view = _safe_call(lambda: get_private_field(page, "listView"))
+            if list_view is None:
+                continue
+            adapter = _safe_call(list_view.getAdapter)
+            if adapter is not None:
+                _safe_call(adapter.notifyDataSetChanged)
 
     def _show_filter_dialog(self):
         fragment = get_last_fragment()
