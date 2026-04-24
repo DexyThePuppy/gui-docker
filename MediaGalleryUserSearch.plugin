@@ -20,7 +20,7 @@ from ui.settings import Header, Input, Switch, Text
 
 from android.content import Context, ClipData
 from android.text import TextWatcher
-from org.telegram.messenger import ApplicationLoader
+from org.telegram.messenger import ApplicationLoader, NotificationCenter, MediaDataController
 
 
 TAG = "[MediaUserSearch]"
@@ -85,6 +85,7 @@ class MediaUserSearchbarPlugin(BasePlugin):
         self._last_applied_query = {}   # layout_id -> native query (from:...)
         self._original_media = {}       # layout_id -> tab_index -> [MessageObject]
         self._snapshot_query = {}       # layout_id -> native query captured in _original_media
+        self._prefetch_state = {}       # layout_id -> {"active": bool}
         self._log_buffer = []
         self._query = ""
         self._debug = False
@@ -106,6 +107,7 @@ class MediaUserSearchbarPlugin(BasePlugin):
         self._last_applied_query.clear()
         self._original_media.clear()
         self._snapshot_query.clear()
+        self._prefetch_state.clear()
         self._profile_ref = None
         self._dlog("unloaded")
 
@@ -203,7 +205,7 @@ class MediaUserSearchbarPlugin(BasePlugin):
                     self._hook_refs.append(refs)
         except Exception:
             pass
-        for name in ("setUserInfo", "setChatInfo", "updateTabs", "scrollToPage"):
+        for name in ("setUserInfo", "setChatInfo", "updateTabs", "scrollToPage", "didReceivedNotification"):
             self._hook_all_methods(cls, name, _SharedMediaHook(self, name))
 
     def _hook_all_methods(self, cls, method_name, hook):
@@ -243,6 +245,13 @@ class MediaUserSearchbarPlugin(BasePlugin):
     def _on_shared_media_event(self, method_name, param):
         layout = param.thisObject
         self._attach_shared_media_layout(layout)
+        if method_name == "didReceivedNotification":
+            try:
+                if param.args and int(param.args[0]) == int(NotificationCenter.mediaDidLoad):
+                    run_on_ui_thread(lambda: self._on_media_loaded(layout), 30)
+            except Exception:
+                pass
+            return
         if method_name in ("setUserInfo", "setChatInfo", "updateTabs", "scrollToPage"):
             run_on_ui_thread(lambda: self._apply_query_to_layout(layout), 40)
 
@@ -340,6 +349,7 @@ class MediaUserSearchbarPlugin(BasePlugin):
         previous = self._last_applied_query.get(lid)
         if previous == native_query:
             self._apply_local_sender_filter(layout)
+            self._schedule_history_prefetch(layout, "same-query")
             if self._debug:
                 run_on_ui_thread(lambda: self._log_filtered_media_snapshot(layout, native_query, "apply-same"), 240)
             return
@@ -361,6 +371,7 @@ class MediaUserSearchbarPlugin(BasePlugin):
 
         run_on_ui_thread(lambda: self._apply_local_sender_filter(layout), 160)
         run_on_ui_thread(lambda: self._apply_local_sender_filter(layout), 420)
+        self._schedule_history_prefetch(layout, "new-query")
         if self._debug:
             run_on_ui_thread(lambda: self._log_filtered_media_snapshot(layout, native_query, "apply-new"), 500)
 
@@ -408,9 +419,24 @@ class MediaUserSearchbarPlugin(BasePlugin):
             messages = _safe_call(lambda: get_private_field(data, "messages"))
             if messages is None:
                 continue
+            current_items = self._copy_java_list(messages)
             if tab_index not in tab_map:
-                tab_map[tab_index] = self._copy_java_list(messages)
+                tab_map[tab_index] = current_items
+            else:
+                self._merge_snapshot_with_current(tab_map[tab_index], current_items)
         return tab_map
+
+    def _merge_snapshot_with_current(self, snapshot, current_items):
+        if snapshot is None or current_items is None:
+            return
+        known = {}
+        for msg in snapshot:
+            known[self._extract_message_id(msg)] = True
+        for msg in current_items:
+            mid = self._extract_message_id(msg)
+            if mid not in known:
+                snapshot.append(msg)
+                known[mid] = True
 
     def _restore_original_media(self, layout, data_array):
         lid = id(layout)
@@ -429,6 +455,124 @@ class MediaUserSearchbarPlugin(BasePlugin):
         self._notify_media_pages_changed(layout)
         self._original_media.pop(lid, None)
         self._snapshot_query.pop(lid, None)
+        self._prefetch_state.pop(lid, None)
+
+    def _on_media_loaded(self, layout):
+        # New chunks arrived -> refresh strict sender filter and continue paging.
+        self._apply_local_sender_filter(layout)
+        self._schedule_history_prefetch(layout, "mediaDidLoad")
+        if self._debug:
+            run_on_ui_thread(lambda: self._log_filtered_media_snapshot(layout, self._native_query(self._query), "media-loaded"), 200)
+
+    def _schedule_history_prefetch(self, layout, reason):
+        target_id, target_text = self._parse_sender_filter(self._query)
+        if target_id is None and not target_text:
+            return
+        lid = id(layout)
+        state = self._prefetch_state.setdefault(lid, {"active": False})
+        if state.get("active"):
+            return
+        state["active"] = True
+        run_on_ui_thread(lambda: self._prefetch_step(layout, reason), 80)
+
+    def _prefetch_step(self, layout, reason):
+        lid = id(layout)
+        state = self._prefetch_state.get(lid)
+        if state is None:
+            return
+        try:
+            target_id, target_text = self._parse_sender_filter(self._query)
+            if target_id is None and not target_text:
+                return
+            if self._request_next_history_page(layout):
+                if self._debug:
+                    self._dlog("prefetch requested (%s)" % reason)
+                return
+            if self._is_selected_tab_loading(layout):
+                run_on_ui_thread(lambda: self._schedule_history_prefetch(layout, "loading-wait"), 380)
+        finally:
+            state["active"] = False
+
+    def _is_selected_tab_loading(self, layout):
+        data_array = _safe_call(lambda: get_private_field(layout, "sharedMediaData"))
+        if data_array is None:
+            return False
+        selected = self._get_selected_tab_type(layout)
+        data = self._array_get(data_array, selected)
+        if data is None:
+            return False
+        return bool(_safe_call(lambda: data.loading, False))
+
+    def _request_next_history_page(self, layout):
+        data_array = _safe_call(lambda: get_private_field(layout, "sharedMediaData"))
+        if data_array is None:
+            return False
+
+        selected = self._get_selected_tab_type(layout)
+        data = self._array_get(data_array, selected)
+        if data is None:
+            return False
+        if bool(_safe_call(lambda: data.loading, False)):
+            return False
+
+        end0 = bool(_safe_call(lambda: data.endReached[0], True))
+        end1 = bool(_safe_call(lambda: data.endReached[1], True))
+        if end0 and end1:
+            return False
+
+        profile = _safe_call(lambda: get_private_field(layout, "profileActivity"))
+        if profile is None:
+            return False
+        media = _safe_call(profile.getMediaDataController)
+        if media is None:
+            return False
+
+        media_type = self._map_media_type_for_tab(selected, data_array)
+        dialog_id = int(_safe_call(lambda: get_private_field(layout, "dialog_id"), 0) or 0)
+        merge_dialog_id = int(_safe_call(lambda: get_private_field(layout, "mergeDialogId"), 0) or 0)
+        topic_id = int(_safe_call(lambda: get_private_field(layout, "topicId"), 0) or 0)
+        class_guid = int(_safe_call(profile.getClassGuid, 0) or 0)
+        req_index = int(_safe_call(lambda: data.requestIndex, 0) or 0)
+        max0 = int(_safe_call(lambda: data.max_id[0], 0) or 0)
+        max1 = int(_safe_call(lambda: data.max_id[1], 0) or 0)
+
+        if not end0 and dialog_id != 0:
+            _safe_call(lambda: setattr(data, "loading", True))
+            _safe_call(lambda: media.loadMedia(dialog_id, 50, max0, 0, media_type, topic_id, 1, class_guid, req_index))
+            return True
+        if merge_dialog_id != 0 and not end1:
+            _safe_call(lambda: setattr(data, "loading", True))
+            _safe_call(lambda: media.loadMedia(merge_dialog_id, 50, max1, 0, media_type, topic_id, 1, class_guid, req_index))
+            return True
+        return False
+
+    def _get_selected_tab_type(self, layout):
+        selected = int(_safe_call(layout.getSelectedTab, -1) or -1)
+        if selected >= 0:
+            return selected
+        pages = _safe_call(lambda: get_private_field(layout, "mediaPages"))
+        page0 = self._array_get(pages, 0) if pages is not None else None
+        selected = int(_safe_call(lambda: get_private_field(page0, "selectedType"), 0) or 0)
+        return max(0, selected)
+
+    def _map_media_type_for_tab(self, selected, data_array):
+        if selected == 0:
+            data0 = self._array_get(data_array, 0)
+            filter_type = int(_safe_call(lambda: data0.filterType, 0) or 0)
+            if filter_type == 1:
+                return int(MediaDataController.MEDIA_PHOTOS_ONLY)
+            if filter_type == 2:
+                return int(MediaDataController.MEDIA_VIDEOS_ONLY)
+            return int(MediaDataController.MEDIA_PHOTOVIDEO)
+        if selected == 1:
+            return int(MediaDataController.MEDIA_FILE)
+        if selected == 2:
+            return int(MediaDataController.MEDIA_AUDIO)
+        if selected == 4:
+            return int(MediaDataController.MEDIA_MUSIC)
+        if selected == 5:
+            return int(MediaDataController.MEDIA_GIF)
+        return int(MediaDataController.MEDIA_URL)
 
     def _message_matches_sender_filter(self, message_obj, target_id, target_text):
         sid = self._extract_sender_id(message_obj)
