@@ -1,7 +1,7 @@
 __id__ = "media_user_searchbar"
 __name__ = "Media User Searchbar"
 __author__ = "@cursor_agent"
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 __description__ = "Uses native SharedMedia search UI and enforces strict sender filtering."
 __min_version__ = "11.12.0"
 __icon__ = "msg_search"
@@ -427,6 +427,81 @@ class MediaUserSearchbarPlugin(BasePlugin):
             self._replace_java_list(messages, filtered)
             self._sync_total_count_field(data, len(filtered))
         self._notify_media_pages_changed(layout)
+        self._sync_profile_media_counter_with_layout(layout)
+
+    def _sync_profile_media_counter_with_layout(self, layout):
+        """ProfileActivity shows counts from SharedMediaPreloader.lastMediaCount, not from
+        SharedMediaData.messages. Patch those values while a sender filter is active so
+        Photos/Videos (and other tabs) match the filtered lists."""
+        profile = _safe_call(lambda: get_private_field(layout, "profileActivity"))
+        if profile is None:
+            return
+        target_id, target_text = self._parse_sender_filter(self._query)
+        filter_active = target_id is not None or bool(target_text)
+        if not filter_active:
+            _safe_call(profile.updateSelectedMediaTabText)
+            return
+        preloader = _safe_call(lambda: get_private_field(profile, "sharedMediaPreloader"))
+        counts = _safe_call(lambda: get_private_field(preloader, "lastMediaCount") if preloader else None)
+        if counts is None:
+            _safe_call(profile.updateSelectedMediaTabText)
+            return
+        data_array = _safe_call(lambda: get_private_field(layout, "sharedMediaData"))
+        if data_array is None:
+            _safe_call(profile.updateSelectedMediaTabText)
+            return
+
+        def _set_media_count_idx(counts_arr, idx, val):
+            try:
+                counts_arr[int(idx)] = jint(max(0, int(val)))
+            except Exception:
+                pass
+
+        data0 = self._array_get(data_array, 0)
+        photo_n = 0
+        video_n = 0
+        if data0 is not None:
+            messages0 = _safe_call(lambda: get_private_field(data0, "messages"))
+            if messages0 is not None:
+                sz = _safe_call(lambda: int(messages0.size()), 0)
+                for i in range(sz):
+                    msg = _safe_call(lambda i=i: messages0.get(i))
+                    if msg is None:
+                        continue
+                    if bool(_safe_call(lambda: msg.isVideo(), False)):
+                        video_n += 1
+                    else:
+                        photo_n += 1
+        ft = int(_safe_call(lambda: data0.filterType, 0) or 0) if data0 is not None else 0
+        # SharedMediaLayout.FILTER_PHOTOS_ONLY == 1, FILTER_VIDEOS_ONLY == 2
+        if ft == 1:
+            _set_media_count_idx(counts, MediaDataController.MEDIA_PHOTOS_ONLY, photo_n + video_n)
+            _set_media_count_idx(counts, MediaDataController.MEDIA_VIDEOS_ONLY, 0)
+        elif ft == 2:
+            _set_media_count_idx(counts, MediaDataController.MEDIA_PHOTOS_ONLY, 0)
+            _set_media_count_idx(counts, MediaDataController.MEDIA_VIDEOS_ONLY, photo_n + video_n)
+        else:
+            _set_media_count_idx(counts, MediaDataController.MEDIA_PHOTOS_ONLY, photo_n)
+            _set_media_count_idx(counts, MediaDataController.MEDIA_VIDEOS_ONLY, video_n)
+        _set_media_count_idx(counts, MediaDataController.MEDIA_PHOTOVIDEO, photo_n + video_n)
+
+        tab_to_const = (
+            (1, MediaDataController.MEDIA_FILE),
+            (2, MediaDataController.MEDIA_AUDIO),
+            (3, MediaDataController.MEDIA_URL),
+            (4, MediaDataController.MEDIA_MUSIC),
+            (5, MediaDataController.MEDIA_GIF),
+        )
+        for tab_idx, const in tab_to_const:
+            data = self._array_get(data_array, tab_idx)
+            n = 0
+            if data is not None:
+                msgs = _safe_call(lambda: get_private_field(data, "messages"))
+                if msgs is not None:
+                    n = _safe_call(lambda: int(msgs.size()), 0)
+            _set_media_count_idx(counts, const, n)
+
+        _safe_call(profile.updateSelectedMediaTabText)
 
     def _ensure_original_media_snapshot(self, layout, data_array, query_key):
         lid = id(layout)
@@ -480,6 +555,7 @@ class MediaUserSearchbarPlugin(BasePlugin):
         self._original_media.pop(lid, None)
         self._snapshot_query.pop(lid, None)
         self._prefetch_state.pop(lid, None)
+        self._sync_profile_media_counter_with_layout(layout)
 
     def _on_media_loaded(self, layout):
         # New chunks arrived -> refresh strict sender filter and continue paging.
@@ -679,7 +755,7 @@ class MediaUserSearchbarPlugin(BasePlugin):
             item = _safe_call(lambda: menu.addItem(jint(MENU_FILTER_ID), jint(icon)))
         if item is None:
             return
-        profile = _safe_call(self._profile)
+        profile = self._profile_ref() if self._profile_ref is not None else None
         allowed = self._is_profile_allowed(profile)
         _safe_call(lambda: item.setVisibility(0 if allowed else 8))
         if allowed:
@@ -711,7 +787,19 @@ class MediaUserSearchbarPlugin(BasePlugin):
                 _safe_call(edit.requestFocus)
         finally:
             self._suppress_text_events = False
+
+        lid = id(layout)
+        previous = self._last_applied_query.get(lid)
+        if previous != native_query:
+            self._original_media.pop(lid, None)
+            self._snapshot_query.pop(lid, None)
+        self._last_applied_query[lid] = native_query
+
         run_on_ui_thread(lambda: self._apply_local_sender_filter(layout), 160)
+        run_on_ui_thread(lambda: self._apply_local_sender_filter(layout), 420)
+        self._schedule_history_prefetch(layout, "menu-open")
+        if self._debug:
+            run_on_ui_thread(lambda: self._log_filtered_media_snapshot(layout, native_query, "menu-open"), 500)
 
     def _refresh_native_hints(self):
         for ref in list(self._layout_refs.values()):
